@@ -1,4 +1,4 @@
-MoonAlign 1.0.0 — third-party components
+MoonAlign 1.1.1 — third-party components
 
 The portable Windows application includes these components:
 Python 3.10.11 and its standard library (including tkinter)

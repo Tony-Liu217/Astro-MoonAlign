@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import ctypes
+import math
 import os
 from pathlib import Path
 import queue
@@ -26,6 +27,13 @@ STAGE_NAMES = {
     "pilot": "小批验证",
     "all": "全量对齐",
     "audit": "最终检查",
+}
+
+PERFORMANCE_MODES = {
+    "安静": "quiet",
+    "均衡（推荐）": "balanced",
+    "高性能": "performance",
+    "自定义": "custom",
 }
 
 
@@ -52,6 +60,71 @@ def _elapsed_text(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours} 小时 {minutes} 分" if hours else f"{minutes} 分 {seconds} 秒"
+
+
+def _nonnegative_number(value) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _performance_text(profile: dict) -> str:
+    """Format engine-selected resources without calculating a second recommendation."""
+    workers = int(profile.get("workers") or 1)
+    threads = int(profile.get("compute_threads") or 1)
+    text = f"实际：{workers} 张并发 × {threads} 线程/张"
+    if profile.get("max_workers"):
+        text += f" · 可选并发 1～{int(profile['max_workers'])}"
+    estimated = _nonnegative_number(profile.get("estimated_memory_bytes"))
+    available = _nonnegative_number(profile.get("available_memory_bytes"))
+    if estimated is not None:
+        text += f" · 预计程序内存 {_size_text(estimated)}"
+    if available is not None:
+        text += f" · 当前可用 {_size_text(available)}"
+    policy = "放宽" if profile.get("memory_policy") == "expanded" else "保守"
+    text += f"\n内存策略：{policy}"
+    reserved = _nonnegative_number(profile.get("reserved_memory_bytes"))
+    if reserved is not None:
+        text += f" · 保留余量 {_size_text(reserved)}"
+    if profile.get("memory_sufficient") is False:
+        text += " · 可用内存不足，请先关闭其他程序"
+    return text + "（内存为估算）"
+
+
+def _effective_memory_policy(mode: str, expanded: bool) -> str:
+    """An advanced choice left checked never changes a preset's safe default."""
+    return "expanded" if mode == "custom" and expanded else "conservative"
+
+
+def _custom_resource_values(workers, compute_threads) -> tuple[int, int]:
+    try:
+        return int(workers), int(compute_threads)
+    except (TypeError, ValueError):
+        raise ValueError("自定义的并发照片和每项计算线程应填写整数。") from None
+
+
+def _runtime_text(event: dict) -> str:
+    """Keep resumed-file checks and the final audit out of registration ETA."""
+    resumed = int(event.get("resumed_frames") or 0)
+    suffix = f" · 已复用 {resumed} 张" if resumed else ""
+    elapsed = _nonnegative_number(event.get("elapsed_seconds"))
+    if event.get("stage") == "audit":
+        done, total = int(event.get("audit_done") or 0), int(event.get("audit_total") or 0)
+        text = f"最终检查 {done}/{total}" if total else "正在进行最终检查"
+        return text + (f" · 已用时 {_elapsed_text(elapsed)}" if elapsed is not None else "") + suffix
+    speed = _nonnegative_number(event.get("throughput_fps"))
+    eta = _nonnegative_number(event.get("eta_seconds"))
+    measured = _nonnegative_number(event.get("processed_new"))
+    if speed is None or speed == 0 or (measured is not None and measured < 3):
+        return "速度：测量中 · 配准预计剩余：测量中" + suffix
+    text = f"配准速度 {speed:.2f} 张/秒"
+    if eta is not None:
+        text += f" · 配准预计剩余约 {_elapsed_text(eta)}（另需最终检查）"
+    else:
+        text += " · 配准预计剩余：测量中"
+    return text + suffix
 
 
 class MoonAlignApp(tk.Tk):
@@ -86,6 +159,11 @@ class MoonAlignApp(tk.Tk):
         self._search_after: str | None = None
         self._result_frames: Path | None = None
         self._result_reports: Path | None = None
+        self._dimensions: list[int] | None = None
+        self._performance_profile: dict | None = None
+        self._performance_generation = 0
+        self._performance_after: str | None = None
+        self._syncing_performance = False
 
         self.source_var = tk.StringVar()
         self.output_var = tk.StringVar()
@@ -97,9 +175,17 @@ class MoonAlignApp(tk.Tk):
         self.progress_var = tk.StringVar(value="0 / 0")
         self.counts_var = tk.StringVar(value="成功 0    失败 0")
         self.workers_var = tk.StringVar(value="3")
+        self.compute_threads_var = tk.StringVar(value="1")
+        self.performance_mode_var = tk.StringVar(value="均衡（推荐）")
+        self.expanded_memory_var = tk.BooleanVar(value=False)
+        self.resource_var = tk.StringVar(value="正在读取 CPU 与可用内存…")
+        self.runtime_var = tk.StringVar(value="速度：等待开始 · 配准预计剩余：测量中")
         self._configure_style()
         self._build()
         self.search_var.trace_add("write", self._search_changed)
+        for variable in (self.performance_mode_var, self.workers_var, self.compute_threads_var, self.expanded_memory_var):
+            variable.trace_add("write", self._performance_changed)
+        self.after(0, self._request_performance)
         self.after(100, self._drain_events)
 
     def _configure_style(self):
@@ -188,16 +274,31 @@ class MoonAlignApp(tk.Tk):
 
         options = ttk.Frame(main)
         options.grid(row=3, column=0, sticky="ew", pady=6)
-        options.grid_columnconfigure(0, weight=1)
-        ttk.Label(options, textvariable=self.inspect_var, style="Muted.TLabel", wraplength=650).grid(row=0, column=0, sticky="w")
-        ttk.Label(options, text="同时处理").grid(row=0, column=1, padx=(8, 4))
-        self.workers_spin = ttk.Spinbox(options, from_=1, to=6, width=3, textvariable=self.workers_var, state="readonly")
-        self.workers_spin.grid(row=0, column=2)
-        ttk.Label(options, text="张").grid(row=0, column=3, padx=(3, 10))
+        options.grid_columnconfigure(7, weight=1)
+        ttk.Label(options, textvariable=self.inspect_var, style="Muted.TLabel", wraplength=980).grid(row=0, column=0, columnspan=10, sticky="w", pady=(0, 4))
+        ttk.Label(options, text="资源模式").grid(row=1, column=0, padx=(0, 5))
+        self.performance_combo = ttk.Combobox(options, values=list(PERFORMANCE_MODES),
+            textvariable=self.performance_mode_var, state="readonly", width=12)
+        self.performance_combo.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        ttk.Label(options, text="并发照片").grid(row=1, column=2, padx=(0, 4))
+        self.workers_spin = ttk.Spinbox(options, from_=1, to=1, width=3,
+            textvariable=self.workers_var, state="disabled")
+        self.workers_spin.grid(row=1, column=3, padx=(0, 12))
+        ttk.Label(options, text="每项计算线程").grid(row=1, column=4, padx=(0, 4))
+        self.compute_threads_spin = ttk.Spinbox(options, from_=1, to=1, width=3,
+            textvariable=self.compute_threads_var, state="disabled")
+        self.compute_threads_spin.grid(row=1, column=5)
         self.start_button = ttk.Button(options, text="开始对齐", command=self._start, state="disabled")
-        self.start_button.grid(row=0, column=4, padx=(0, 6))
+        self.start_button.grid(row=1, column=8, padx=(8, 6))
         self.cancel_button = ttk.Button(options, text="取消", command=self._cancel, state="disabled")
-        self.cancel_button.grid(row=0, column=5)
+        self.cancel_button.grid(row=1, column=9)
+        self.memory_checkbox = ttk.Checkbutton(options, text="放宽内存限制（高级）",
+            variable=self.expanded_memory_var, state="disabled")
+        self.memory_checkbox.grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(options, text="仅自定义可用；可能增加内存压力，更多并发不保证更快。",
+            style="Muted.TLabel").grid(row=2, column=3, columnspan=7, sticky="w", padx=(8, 0), pady=(3, 0))
+        ttk.Label(options, textvariable=self.resource_var, style="Muted.TLabel", wraplength=980).grid(
+            row=3, column=0, columnspan=10, sticky="w", pady=(4, 0))
 
         progress = ttk.Frame(main)
         progress.grid(row=4, column=0, sticky="ew", pady=(0, 6))
@@ -207,6 +308,8 @@ class MoonAlignApp(tk.Tk):
         self.progress = ttk.Progressbar(progress, mode="determinate", maximum=1)
         self.progress.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         ttk.Label(progress, textvariable=self.progress_var, width=15, anchor="e").grid(row=1, column=1, padx=(8, 0), sticky="e")
+        ttk.Label(progress, textvariable=self.runtime_var, style="Muted.TLabel", wraplength=980).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         log_frame = ttk.LabelFrame(main, text="处理日志", padding=5)
         log_frame.grid(row=5, column=0, sticky="nsew")
@@ -225,6 +328,75 @@ class MoonAlignApp(tk.Tk):
         self.frames_button.grid(row=0, column=1, padx=(8, 5))
         self.reports_button = ttk.Button(footer, text="打开报告", command=lambda: self._open_result("reports"), state="disabled")
         self.reports_button.grid(row=0, column=2)
+
+    def _performance_changed(self, *_args):
+        if self._syncing_performance or self._running:
+            return
+        self._performance_generation += 1
+        self._performance_profile = None
+        self.resource_var.set("正在更新资源估算…")
+        self._update_performance_controls()
+        self._update_selection_label()
+        if self._performance_after:
+            self.after_cancel(self._performance_after)
+        self._performance_after = self.after(220, self._request_performance)
+
+    def _update_performance_controls(self):
+        self.performance_combo.configure(state="disabled" if self._running else "readonly")
+        custom = PERFORMANCE_MODES.get(self.performance_mode_var.get()) == "custom"
+        state = "normal" if custom and not self._running else "disabled"
+        self.workers_spin.configure(state=state)
+        self.compute_threads_spin.configure(state=state)
+        self.memory_checkbox.configure(state=state)
+
+    def _request_performance(self):
+        self._performance_after = None
+        if self._closed or self._running:
+            return
+        self._performance_generation += 1
+        generation = self._performance_generation
+        mode = PERFORMANCE_MODES.get(self.performance_mode_var.get(), "balanced")
+        policy = _effective_memory_policy(mode, self.expanded_memory_var.get())
+        settings = (self._dimensions, mode, self.workers_var.get(), self.compute_threads_var.get(), generation, policy)
+        threading.Thread(target=self._performance_worker, args=settings, daemon=True).start()
+
+    def _performance_worker(self, dimensions, mode, workers, compute_threads, generation, memory_policy="conservative"):
+        limits = None
+        try:
+            from .engine import get_performance_profile
+            policy = _effective_memory_policy(mode, memory_policy == "expanded")
+            if mode == "custom":
+                limits = get_performance_profile(dimensions, mode="custom", memory_policy=policy)
+                selected_workers, threads = _custom_resource_values(workers, compute_threads)
+                limits = get_performance_profile(dimensions, mode="custom", compute_threads=threads, memory_policy=policy)
+                profile = get_performance_profile(dimensions, mode="custom", workers=selected_workers,
+                                                  compute_threads=threads, memory_policy=policy)
+            else:
+                profile = get_performance_profile(dimensions, mode=mode, memory_policy="conservative")
+            self.events.put(("performance", generation, profile))
+        except (ValueError, TypeError) as error:
+            self.events.put(("performance_error", generation, str(error), limits))
+        except Exception as error:
+            _error_log(traceback.format_exc())
+            self.events.put(("performance_error", generation, f"无法读取资源信息：{error}", limits))
+
+    def _apply_performance_limits(self, profile: dict):
+        self.workers_spin.configure(to=max(1, int(profile.get("max_workers") or 1)))
+        self.compute_threads_spin.configure(to=max(1, int(profile.get("max_compute_threads") or
+                                                          profile.get("logical_cpus") or 1)))
+
+    def _apply_performance(self, profile: dict):
+        self._performance_profile = profile
+        self._apply_performance_limits(profile)
+        self._syncing_performance = True
+        try:
+            self.workers_var.set(str(profile["workers"]))
+            self.compute_threads_var.set(str(profile["compute_threads"]))
+        finally:
+            self._syncing_performance = False
+        self.resource_var.set(_performance_text(profile) + " · 精度与校验不变")
+        self._update_performance_controls()
+        self._update_selection_label()
 
     def _custom_output(self):
         self._output_is_auto = False
@@ -250,6 +422,8 @@ class MoonAlignApp(tk.Tk):
         self._reference_index = None
         self._reference_user_chosen = False
         self._inspection_ready = False
+        self._dimensions = None
+        self._performance_changed()
         self.search_var.set("")
         self.reference_var.set("参考片：正在读取文件…")
         self.inspect_var.set("正在检查 TIFF 文件，请稍候…")
@@ -341,7 +515,7 @@ class MoonAlignApp(tk.Tk):
 
     def _update_selection_label(self):
         self.selection_var.set(f"已勾选 {len(self._checked)} / {len(self._files)} 张 · 显示 {len(self._visible_indices)} 张")
-        enabled = bool(self._checked) and self._inspection_ready and not self._running
+        enabled = bool(self._checked) and self._inspection_ready and not self._running and self._performance_profile is not None
         self.start_button.configure(state="normal" if enabled else "disabled")
 
     def _ensure_reference(self):
@@ -451,6 +625,8 @@ class MoonAlignApp(tk.Tk):
         message = str(result.get("message") or "文件检查完成。")
         count = int(result.get("valid_count", len(self._files) - len(self._invalid)))
         dimensions = result.get("dimensions")
+        self._dimensions = list(dimensions) if dimensions else None
+        self._performance_changed()
         details = f"可用 {count} 张"
         if dimensions:
             details += f" · {dimensions[0]} × {dimensions[1]}"
@@ -469,7 +645,7 @@ class MoonAlignApp(tk.Tk):
         for widget in [self.source_button, self.output_entry, self.output_button, self.all_button,
                        self.none_button, self.reference_button, self.search_entry]:
             widget.configure(state=state)
-        self.workers_spin.configure(state="disabled" if busy else "readonly")
+        self._update_performance_controls()
         self.cancel_button.configure(state="normal" if busy else "disabled", text="取消")
         self._update_selection_label()
 
@@ -489,16 +665,22 @@ class MoonAlignApp(tk.Tk):
                 raise ValueError("输出目录必须与输入目录分开，不能是输入目录本身、其内部目录或上级目录。")
             if not output.parent.is_dir():
                 raise ValueError("输出目录的上级文件夹不存在，请先选择已有的位置。")
-            workers = int(self.workers_var.get())
-            if workers < 1 or workers > 6:
-                raise ValueError("同时处理的数量应为 1～6。")
+            from .engine import get_performance_profile
+            mode = PERFORMANCE_MODES.get(self.performance_mode_var.get(), "balanced")
+            policy = _effective_memory_policy(mode, self.expanded_memory_var.get())
+            selected_workers, threads = (_custom_resource_values(self.workers_var.get(), self.compute_threads_var.get())
+                                        if mode == "custom" else (None, None))
+            profile = get_performance_profile(self._dimensions, mode=mode,
+                workers=selected_workers, compute_threads=threads, memory_policy=policy)
         except (OSError, ValueError) as error:
-            messagebox.showerror("请检查输出位置", str(error), parent=self)
+            messagebox.showerror("请检查设置", str(error), parent=self)
             return
         files = [self._files[index] for index in sorted(self._checked)]
         reference = self._files[self._reference_index]
         self.output_var.set(str(output))
         self._cancel_event = threading.Event()
+        self._performance_generation += 1
+        self._apply_performance(profile)
         self._file_results.clear()
         self._result_frames = None
         self._result_reports = None
@@ -507,16 +689,25 @@ class MoonAlignApp(tk.Tk):
         self.progress.configure(maximum=max(1, len(files)), value=0)
         self.progress_var.set(f"0 / {len(files)}")
         self.counts_var.set("成功 0    失败 0")
+        self.runtime_var.set("速度：测量中 · 配准预计剩余：测量中")
         self.stage_var.set("准备小批验证")
         self._append_log(f"开始：{len(files)} 张；参考片 {reference.name}；输出 {output}")
+        hardware = f"{profile.get('logical_cpus', '?')} 个 CPU 逻辑线程"
+        if profile.get("physical_cores"):
+            hardware = f"{profile['physical_cores']} 核 / " + hardware
+        self._append_log(f"资源模式：{self.performance_mode_var.get()}；{hardware}；" + _performance_text(profile))
+        if profile.get("note"):
+            self._append_log(str(profile["note"]))
         self._set_busy(True)
         threading.Thread(target=self._run_worker,
-            args=(files, reference, output, workers, self._cancel_event), daemon=True).start()
+            args=(files, reference, output, profile["workers"], profile["compute_threads"], self._cancel_event,
+                  profile.get("memory_policy", policy)), daemon=True).start()
 
-    def _run_worker(self, files, reference, output, workers, cancel_event):
+    def _run_worker(self, files, reference, output, workers, compute_threads, cancel_event, memory_policy="conservative"):
         try:
             from .engine import run_alignment
             summary = run_alignment(files=files, reference=reference, output=output, workers=workers,
+                compute_threads=compute_threads, memory_policy=memory_policy,
                 progress=lambda event: self.events.put(("engine", event)), cancel_event=cancel_event)
             self.events.put(("worker_finished", summary))
         except Exception as error:
@@ -528,6 +719,14 @@ class MoonAlignApp(tk.Tk):
         stage = STAGE_NAMES.get(str(event.get("stage", "")), "正在处理")
         total = int(event.get("total") or self.progress["maximum"] or 1)
         done = int(event.get("done") or 0)
+        if not self._cancel_event.is_set():
+            self.runtime_var.set(_runtime_text(event))
+        if event.get("workers") and event.get("compute_threads"):
+            actual = dict(self._performance_profile or {})
+            actual.update({key: event[key] for key in ("workers", "compute_threads", "estimated_memory_bytes",
+                                                       "memory_policy", "reserved_memory_bytes", "max_workers")
+                           if event.get(key) is not None})
+            self.resource_var.set(_performance_text(actual) + " · 精度与校验不变")
         if kind in {"start", "frame"}:
             self.progress.configure(maximum=max(1, total), value=min(done, total))
             self.progress_var.set(f"{done} / {total}")
@@ -554,6 +753,7 @@ class MoonAlignApp(tk.Tk):
         self.cancel_button.configure(state="disabled", text="正在停止…")
         self.stage_var.set("正在安全停止，等待当前照片写入完成…")
         self._append_log("已请求停止；正在处理的照片会安全完成，已完成结果可继续使用或续跑。")
+        self.runtime_var.set("已请求停止，剩余时间不再估算。")
 
     def _finish(self, summary: dict):
         success, failed = int(summary.get("success", 0)), int(summary.get("failed", 0))
@@ -561,6 +761,14 @@ class MoonAlignApp(tk.Tk):
         self.progress.configure(maximum=max(total, 1), value=min(success + failed, total))
         self.progress_var.set(f"{success + failed} / {total}")
         self.counts_var.set(f"成功 {success}    失败 {failed}")
+        speed = _nonnegative_number(summary.get("throughput_fps"))
+        elapsed = _nonnegative_number(summary.get("elapsed_seconds")) or 0
+        runtime = f"总用时 {_elapsed_text(elapsed)}"
+        if speed:
+            runtime += f" · 新配准平均 {speed:.2f} 张/秒"
+        if summary.get("resumed_frames"):
+            runtime += f" · 已复用 {int(summary['resumed_frames'])} 张"
+        self.runtime_var.set(runtime)
         self._result_frames = Path(summary["output_directory"]) if summary.get("output_directory") else None
         self._result_reports = Path(summary["report_directory"]) if summary.get("report_directory") else None
         self._set_busy(False)
@@ -637,6 +845,16 @@ class MoonAlignApp(tk.Tk):
                     self._render_files()
                 elif kind == "inspection" and event[1] == self._scan_generation:
                     self._apply_inspection(event[2])
+                elif kind == "performance" and event[1] == self._performance_generation and not self._running:
+                    self._apply_performance(event[2])
+                elif kind == "performance_error" and event[1] == self._performance_generation and not self._running:
+                    self._performance_profile = None
+                    if event[3]:
+                        self._apply_performance_limits(event[3])
+                    details = _performance_text(event[3]) + "\n" if event[3] else ""
+                    self.resource_var.set(details + "请调整资源设置：" + event[2])
+                    self._update_performance_controls()
+                    self._update_selection_label()
                 elif kind == "scan_error" and event[1] == self._scan_generation:
                     self._inspection_ready = False
                     self.inspect_var.set("文件检查失败，请查看日志或重新选择文件夹。")
@@ -651,6 +869,7 @@ class MoonAlignApp(tk.Tk):
                 elif kind == "worker_error":
                     self._set_busy(False)
                     self.stage_var.set("处理未完成，请检查错误信息")
+                    self.runtime_var.set("任务未完成，已停止时间估算。")
                     self._append_log(event[1], "error")
                     suffix = f"\n\n错误详情：{event[2]}" if event[2] else ""
                     if self._close_requested:
@@ -697,7 +916,11 @@ class MoonAlignApp(tk.Tk):
             "适用于同一批、相同尺寸的近满月完整月盘。画面每边 800～6000 像素，月盘等效直径至少 800 像素，建议 1000 像素以上。\n"
             "同一批的焦距、增距镜和导出缩放比例应一致；更换焦距或缩放比例的照片应分开处理。\n"
             "校正旋转和平移，不会补回失焦、运动模糊或被切掉的月面。\n"
-            "输入文件保持不变。取消会等待在途照片完成；选择同一批文件、参考片和原输出目录可续跑。",
+            "输入文件保持不变。取消会等待在途照片完成；选择同一批文件、参考片和原输出目录可续跑。\n\n"
+            "资源模式：安静、均衡（推荐）、高性能和自定义。推荐值根据 CPU、当前可用内存和图片尺寸调整。\n"
+            "自定义可设置并发照片和每项计算线程；更高并发不一定更快。所有模式保留相同精度与完整检查。\n"
+            "仅在自定义模式可勾选“放宽内存限制（高级）”；它减少保留内存余量，可能增加内存压力。默认关闭，其他模式保持保守策略。\n"
+            "速度仅统计新配准的照片，复用结果和最终检查单独计量；剩余时间为估算，不包括最终检查。",
             parent=self)
 
     def _close(self):

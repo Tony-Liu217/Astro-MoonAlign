@@ -6,6 +6,7 @@ Public API: inspect_files() and run_alignment(). No GUI or CLI dependencies.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import ctypes
 import csv
 import hashlib
 import io
@@ -20,6 +21,7 @@ import sys
 import time
 import traceback
 import threading
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -41,7 +43,121 @@ PARAMETERS = {
     'lk_refinement': 'accept only if held-out median, p90, angle and shift do not degrade',
     'output': 'uncompressed_baseline_chunky_RGB_UInt16_TIFF_source_ICC_only',
 }
-cv2.setNumThreads(1)
+# OpenCV's thread count is process-global. Only a running alignment owns this
+# lock; importing the library never changes settings used by another component.
+_COMPUTE_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _cpu_resources():
+    logical, physical = max(1, os.cpu_count() or 1), None
+    if os.name == 'nt':
+        try:
+            class ProcessorInfo(ctypes.Structure):
+                _fields_ = [('mask', ctypes.c_size_t), ('relationship', ctypes.c_ulong),
+                            ('reserved', ctypes.c_ulonglong * 2)]
+            size = ctypes.c_ulong()
+            query = ctypes.windll.kernel32.GetLogicalProcessorInformation
+            query(None, ctypes.byref(size))
+            if size.value and size.value % ctypes.sizeof(ProcessorInfo) == 0:
+                data = ctypes.create_string_buffer(size.value)
+                if query(data, ctypes.byref(size)):
+                    array = ctypes.cast(data, ctypes.POINTER(ProcessorInfo))
+                    physical = sum(array[i].relationship == 0
+                                   for i in range(size.value // ctypes.sizeof(ProcessorInfo))) or None
+            # Respect an explicitly restricted process affinity when available.
+            process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+            affinity = ctypes.windll.kernel32.GetProcessAffinityMask
+            affinity.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+            if affinity(ctypes.c_void_p(-1), ctypes.byref(process_mask), ctypes.byref(system_mask)):
+                logical = min(logical, process_mask.value.bit_count()) or logical
+        except (OSError, AttributeError, ValueError):
+            pass
+    return logical, min(physical, logical) if physical else None
+
+
+def _memory_resources():
+    if os.name == 'nt':
+        try:
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong) for name in ('total', 'available', 'page_total',
+                    'page_available', 'virtual_total', 'virtual_available', 'extended')]
+            info = MemoryStatus()
+            info.length = ctypes.sizeof(info)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(info)):
+                return int(info.total), int(info.available)
+        except (OSError, AttributeError):
+            pass
+    # Conservative fallback rather than claiming the whole machine is available.
+    return 8 * 1024**3, 4 * 1024**3
+
+
+def get_performance_profile(dimensions=None, mode='balanced', workers=None, compute_threads=None,
+                            memory_policy='conservative'):
+    """Choose bounded resources only; all four modes use identical quality gates.
+
+    dimensions is [width, height], or None for the measured 1800x1800 baseline.
+    Custom worker/compute settings must fit both logical CPUs and available RAM.
+    Both memory policies retain a bounded reserve. Expanded is an explicit
+    advanced opt-in; estimates are not promises about other applications.
+    """
+    if mode not in ('quiet', 'balanced', 'performance', 'custom'):
+        raise ValueError('未知性能模式')
+    if memory_policy not in ('conservative', 'expanded'):
+        raise ValueError('未知内存策略，应为 conservative 或 expanded')
+    if dimensions is None:
+        dimensions = (1800, 1800)
+    if len(dimensions) != 2 or any(int(value) <= 0 for value in dimensions):
+        raise ValueError('性能估算需要有效的图片宽度和高度')
+    pixels = int(dimensions[0]) * int(dimensions[1])
+    logical, physical = _cpu_resources()
+    total, available = _memory_resources()
+    automatic_threads = 2 if mode in ('balanced', 'performance') and logical >= 4 else 1
+    threads = int(compute_threads if mode == 'custom' and compute_threads is not None else automatic_threads)
+    if not 1 <= threads <= min(8, logical):
+        raise ValueError(f'每项计算线程应为 1～{min(8, logical)}')
+    # Measured Windows/OpenCV peaks were ~0.8 GiB per simultaneous 1800² SIFT
+    # frame. The per-worker estimate is unchanged by the advanced policy; only
+    # the reserved RAM differs. CPU and RAM limits always remain in force.
+    per_worker = max(256 * 1024**2, int(pixels * 300))
+    overhead = 384 * 1024**2 + pixels * 40
+    reserve = (max(3 * 1024**3, int(available * .25)) if memory_policy == 'conservative'
+               else max(1024**3, int(available * .10)))
+    memory_workers = max(0, (available - reserve - overhead) // per_worker)
+    # With RAM limiting simultaneous pictures, 3x4 was faster than 3x2 on the
+    # 20-thread validation machine at the same ~2.9 GiB peak private memory.
+    # Raise inner parallelism only when it fits without reducing photo workers.
+    if mode == 'performance' and threads == 2 and 1 <= memory_workers <= logical // 4:
+        threads = 4
+    maximum = max(1, min(32, logical // threads, int(memory_workers)))
+    requested = {'quiet': max(1, logical // 5), 'balanced': max(1, logical * 3 // 10),
+                 'performance': max(1, logical // threads), 'custom': 3}[mode]
+    if mode == 'custom' and workers is not None:
+        requested = int(workers)
+        if not 1 <= requested <= maximum:
+            raise ValueError(f'当前 CPU/可用内存下并行数量应为 1～{maximum}')
+    chosen = min(maximum, requested)
+    estimated = int(overhead + chosen * per_worker)
+    sufficient = bool(memory_workers >= 1)
+    note = '所有模式保留相同配准精度和完整校验；更高并发不保证更快。'
+    if chosen < requested:
+        note += ' 已按当前 CPU/可用内存限制并发。'
+    if mode == 'performance' and threads == 4:
+        note += ' 内存限制并发时，使用更多计算线程。'
+    if memory_policy == 'expanded':
+        note += ' 已放宽内存限制：预留至少 1 GiB，且不少于当前可用内存的 10%；可能增加换页、卡顿或内存不足的风险。'
+    if not sufficient:
+        note += ' 当前可用内存偏低，开始前请关闭占用内存的程序。'
+    return {'mode': mode, 'workers': chosen, 'compute_threads': threads,
+            'max_workers': maximum, 'max_compute_threads': min(8, logical),
+            'estimated_memory_bytes': estimated,
+            'available_memory_bytes': available, 'total_memory_bytes': total,
+            'logical_cpus': logical, 'physical_cores': physical,
+            'memory_sufficient': sufficient, 'memory_per_worker_bytes': per_worker,
+            'memory_policy': memory_policy, 'reserved_memory_bytes': reserve,
+            'memory_budget_bytes': max(0, available - reserve),
+            'note': note}
 
 
 def digest(data):
@@ -313,7 +429,8 @@ class _JobLock:
 
 
 class _Job:
-    def __init__(self, files, reference, output, workers, callback, cancel_event):
+    def __init__(self, files, reference, output, workers, callback, cancel_event, compute_threads=1,
+                 memory_policy='conservative'):
         self.paths = _paths(files)
         if not self.paths:
             raise ValueError('没有选择图片')
@@ -328,12 +445,22 @@ class _Job:
         if not self.output.parent.is_dir():
             raise ValueError('输出文件夹的上级目录不存在')
         self.workers = int(workers)
-        if not 1 <= self.workers <= 6:
-            raise ValueError('并行数量应为 1～6')
+        if not 1 <= self.workers <= 32:
+            raise ValueError('并行数量应为 1～32，并受当前 CPU 和可用内存限制')
+        self.compute_threads = int(compute_threads)
+        if not 1 <= self.compute_threads <= 8:
+            raise ValueError('每项计算线程应为 1～8')
+        if memory_policy not in ('conservative', 'expanded'):
+            raise ValueError('未知内存策略，应为 conservative 或 expanded')
+        self.memory_policy = memory_policy
         self.callback = callback
         self.cancel = cancel_event or threading.Event()
         self.records = {}
         self.started = time.perf_counter()
+        self.processing_seconds = 0.
+        self.processing_started = None
+        self.resources = None
+        self.audit_done = 0
         self.pilot_passed = False
         self.stage = 'inspect'
         self.frames = self.output / 'frames'
@@ -345,14 +472,33 @@ class _Job:
         self.inventory_by_name = {x['name']: x for x in self.inventory}
 
     def emit(self, event, **fields):
+        counters = self.progress_counters()
         payload = {'event': event, 'stage': self.stage, 'done': len(self.records),
-                   'total': len(self.paths), 'filename': '', 'status': '', 'message': '', **fields}
+                   'total': len(self.paths), 'filename': '', 'status': '', 'message': '',
+                   **counters, **fields}
         if self.callback is not None:
             try:
                 self.callback(payload)
             except Exception:
                 # A closing GUI must not interrupt an atomic image write.
                 pass
+
+    def progress_counters(self):
+        now = time.perf_counter()
+        new = sum(not r.get('resumed', False) for r in self.records.values())
+        resumed = sum(r.get('resumed', False) for r in self.records.values())
+        processing = self.processing_seconds + (now - self.processing_started
+                         if self.processing_started is not None else 0.)
+        speed = new / processing if new and processing > 0 else None
+        remaining = max(0, len(self.paths) - len(self.records))
+        eta = remaining / speed if speed and self.stage in ('pilot', 'all') and not self.cancel.is_set() else None
+        return {'elapsed_seconds': now - self.started, 'processed_new': new,
+                'resumed_frames': resumed, 'throughput_fps': speed, 'eta_seconds': eta,
+                'workers': self.workers, 'compute_threads': self.compute_threads,
+                'memory_policy': self.memory_policy,
+                'reserved_memory_bytes': self.resources['reserved_memory_bytes'] if self.resources else None,
+                'estimated_memory_bytes': self.resources['estimated_memory_bytes'] if self.resources else None,
+                'audit_done': self.audit_done, 'audit_total': len(self.paths)}
 
     def initialize(self):
         self.emit('start', message='检查输入格式和参考月盘')
@@ -362,6 +508,10 @@ class _Job:
             raise ValueError(f"输入格式检查失败：{first['file']}；{first['error']}")
         if not inspection['uniform_dimensions']:
             raise ValueError('选择的图片尺寸不一致，请先在 PIPP 中统一裁切尺寸')
+        self.resources = get_performance_profile(inspection['dimensions'], 'custom',
+                                                self.workers, self.compute_threads, self.memory_policy)
+        if not self.resources['memory_sufficient']:
+            raise ValueError('当前可用内存不足以安全处理一张图片，请关闭占用内存的程序后重试')
         ref_data = self.reference_path.read_bytes()
         ref_md = metadata(ref_data)
         _check_metadata(ref_md)
@@ -419,7 +569,10 @@ class _Job:
         if shutil.disk_usage(self.output).free < needed + max(2 * 1024**3, int(needed * .05)):
             raise ValueError('输出磁盘空间不足；需要容纳未压缩 16 位彩色 TIFF 及临时写入空间')
         atomic_json(self.reports / 'runtime.json', {'python': sys.version, 'opencv': cv2.__version__,
-                    'numpy': np.__version__, 'workers': self.workers, 'algorithm_version': ALGORITHM_VERSION})
+                    'numpy': np.__version__, 'workers': self.workers,
+                    'compute_threads': self.compute_threads, 'performance_resources': self.resources,
+                    'memory_policy': self.memory_policy,
+                    'algorithm_version': ALGORITHM_VERSION})
 
     def record_path(self, path):
         return self.metrics / (path.name + '.json')
@@ -596,6 +749,7 @@ class _Job:
 
     def run_stage(self, paths, stage):
         self.stage = stage
+        self.processing_started = time.perf_counter()
         self.emit('message', message='跨时段小批验证' if stage == 'pilot' else '批量精细旋转配准')
         iterator, pending = iter(paths), {}
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -622,6 +776,8 @@ class _Job:
                               resumed=result.get('resumed', False),
                               message=result.get('error', '已核验并恢复' if result.get('resumed') else '配准和 TIFF 写入校验通过'))
                 fill()
+        self.processing_seconds += time.perf_counter() - self.processing_started
+        self.processing_started = None
 
     def summary(self, status, **extra):
         good = [r for r in self.records.values() if r['status'] == 'success']
@@ -635,6 +791,7 @@ class _Job:
                 'resumed_frames': sum(r.get('resumed', False) for r in good),
                 'refined_frames': sum(r.get('refinement', {}).get('applied', False) for r in good),
                 'elapsed_seconds': time.perf_counter() - self.started,
+                **self.progress_counters(),
                 'median_independent_texture_error_px': float(np.median([r['validation']['median_px'] for r in good])) if good else None,
                 'worst_independent_remaining_angle_deg': max((abs(r['validation']['remaining_angle_deg']) for r in good), default=None),
                 **extra}
@@ -660,6 +817,7 @@ class _Job:
 
     def audit(self):
         self.stage = 'audit'
+        self.audit_done = 0
         self.emit('message', message='核对全部输出校验和、格式、文件名及原片状态')
         problems, changed = [], []
         for index, path in enumerate(self.paths, 1):
@@ -672,6 +830,7 @@ class _Job:
             record = self.records.get(path.name)
             if record and record['status'] == 'success' and self.valid_resume(path) is None:
                 problems.append(path.name)
+            self.audit_done = index
             if index % 50 == 0 or index == len(self.paths):
                 self.emit('message', message=f'输出校验 {index}/{len(self.paths)}')
         ref_stat = self.reference_path.stat()
@@ -730,13 +889,28 @@ class _Job:
         return summary
 
 
-def run_alignment(files, reference, output, workers=3, progress=None, cancel_event=None):
+def run_alignment(files, reference, output, workers=3, progress=None, cancel_event=None, compute_threads=1,
+                  memory_policy='conservative'):
     """Pilot -> full selected sequence -> integrity audit; no input file is written.
 
     Progress callbacks run from the orchestration thread, not the GUI thread.
     Cancellation stops new submissions and safely waits for current image writes.
     Repeat with identical inputs/reference/output to resume verified checkpoints.
+    Expanded memory policy changes only the RAM reserve, never pixel processing
+    or quality gates. Resource changes do not invalidate verified checkpoints.
     """
-    job = _Job(files, reference, output, workers, progress, cancel_event)
-    return job.run()
+    if not _COMPUTE_LOCK.acquire(blocking=False):
+        raise RuntimeError('同一程序内已有配准任务运行；请等待完成或安全停止后再开始')
+    previous_threads = None
+    try:
+        previous_threads = cv2.getNumThreads()
+        job = _Job(files, reference, output, workers, progress, cancel_event, compute_threads, memory_policy)
+        cv2.setNumThreads(job.compute_threads)
+        return job.run()
+    finally:
+        try:
+            if previous_threads is not None:
+                cv2.setNumThreads(previous_threads)
+        finally:
+            _COMPUTE_LOCK.release()
 

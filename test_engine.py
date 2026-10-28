@@ -12,6 +12,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import cv2
@@ -131,6 +132,135 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 with engine._JobLock(path):
                     self.fail('Two writers acquired the same output lock')
+
+    def test_resource_profiles_respect_cpu_and_memory_without_quality_changes(self):
+        before = dict(engine.PARAMETERS)
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(32 * 1024**3, 24 * 1024**3)):
+            profiles = [engine.get_performance_profile(mode=mode)
+                        for mode in ('quiet', 'balanced', 'performance')]
+            for profile in profiles:
+                self.assertLessEqual(profile['workers'] * profile['compute_threads'], 20)
+                self.assertLess(profile['estimated_memory_bytes'], profile['available_memory_bytes'])
+                self.assertTrue(profile['memory_sufficient'])
+            self.assertLessEqual(profiles[0]['workers'], profiles[-1]['workers'])
+            custom = engine.get_performance_profile(mode='custom', workers=10, compute_threads=2)
+            self.assertEqual((custom['workers'], custom['compute_threads']), (10, 2))
+            with self.assertRaises(ValueError):
+                engine.get_performance_profile(mode='custom', workers=11, compute_threads=2)
+            large = engine.get_performance_profile((6000, 6000), mode='performance')
+            self.assertLess(large['max_workers'], profiles[-1]['max_workers'])
+        self.assertEqual(before, engine.PARAMETERS)
+
+    def test_low_memory_is_reported_without_claiming_it_is_safe(self):
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(8 * 1024**3, 2 * 1024**3)):
+            profile = engine.get_performance_profile(mode='performance')
+        self.assertFalse(profile['memory_sufficient'])
+        self.assertEqual(profile['workers'], 1)
+
+    def test_default_memory_policy_retains_original_conservative_budget(self):
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(32 * 1024**3, 7 * 1024**3)):
+            default = engine.get_performance_profile(mode='custom', compute_threads=2)
+            explicit = engine.get_performance_profile(mode='custom', compute_threads=2,
+                                                       memory_policy='conservative')
+        self.assertEqual(default, explicit)
+        self.assertEqual(default['max_workers'], 3)
+        self.assertEqual(default['reserved_memory_bytes'], 3 * 1024**3)
+        self.assertEqual(default['memory_policy'], 'conservative')
+
+    def test_expanded_memory_policy_allows_more_workers_but_retains_both_limits(self):
+        before = dict(engine.PARAMETERS)
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(32 * 1024**3, 7 * 1024**3)):
+            expanded = engine.get_performance_profile(mode='custom', workers=6, compute_threads=2,
+                                                       memory_policy='expanded')
+            self.assertEqual((expanded['workers'], expanded['max_workers']), (6, 6))
+            self.assertEqual(expanded['reserved_memory_bytes'], 1024**3)
+            self.assertEqual(expanded['memory_policy'], 'expanded')
+            self.assertLessEqual(expanded['estimated_memory_bytes'], expanded['memory_budget_bytes'])
+            # Fits CPU but exceeds the expanded RAM budget.
+            with self.assertRaises(ValueError):
+                engine.get_performance_profile(mode='custom', workers=7, compute_threads=2,
+                                               memory_policy='expanded')
+            # Fits the expanded RAM budget but exceeds the logical CPU budget.
+            with self.assertRaises(ValueError):
+                engine.get_performance_profile(mode='custom', workers=6, compute_threads=4,
+                                               memory_policy='expanded')
+        self.assertEqual(before, engine.PARAMETERS)
+
+    def test_unknown_memory_policy_is_rejected(self):
+        with self.assertRaises(ValueError):
+            engine.get_performance_profile(memory_policy='unlimited')
+
+    def test_memory_policies_retain_percentage_reserve_at_high_available_ram(self):
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(32 * 1024**3, 24 * 1024**3)):
+            conservative = engine.get_performance_profile()
+            expanded = engine.get_performance_profile(memory_policy='expanded')
+        self.assertEqual(conservative['reserved_memory_bytes'], 6 * 1024**3)
+        self.assertEqual(expanded['reserved_memory_bytes'], int(24 * 1024**3 * .10))
+        self.assertEqual(conservative['memory_per_worker_bytes'], expanded['memory_per_worker_bytes'])
+
+    def test_performance_uses_inner_threads_when_memory_limits_photos(self):
+        with patch.object(engine, '_cpu_resources', return_value=(20, 12)), \
+                patch.object(engine, '_memory_resources', return_value=(32 * 1024**3, 7 * 1024**3)):
+            balanced = engine.get_performance_profile(mode='balanced')
+            performance = engine.get_performance_profile(mode='performance')
+        self.assertEqual((balanced['workers'], balanced['compute_threads']), (3, 2))
+        self.assertEqual((performance['workers'], performance['compute_threads']), (3, 4))
+        self.assertEqual(balanced['estimated_memory_bytes'], performance['estimated_memory_bytes'])
+        self.assertLessEqual(performance['workers'] * performance['compute_threads'], 20)
+
+    def test_opencv_threads_are_restored_after_cancel_and_error(self):
+        source = self.root / 'source.tif'
+        engine.write_tiff(source, np.zeros((800, 800, 3), np.uint16), b'')
+        previous = cv2.getNumThreads()
+        try:
+            cv2.setNumThreads(3)
+            cancelled = threading.Event()
+            cancelled.set()
+            engine.run_alignment([source], source, self.root / 'cancelled',
+                                 cancel_event=cancelled, compute_threads=2)
+            self.assertEqual(cv2.getNumThreads(), 3)
+            with self.assertRaises(ValueError):
+                engine.run_alignment([source], source, self.root / 'error', compute_threads=2)
+            self.assertEqual(cv2.getNumThreads(), 3)
+        finally:
+            cv2.setNumThreads(previous)
+
+    def test_same_process_jobs_cannot_race_opencv_thread_settings(self):
+        with engine._COMPUTE_LOCK:
+            with self.assertRaises(RuntimeError):
+                engine.run_alignment([], '', '', compute_threads=2)
+
+    def test_resource_change_resumes_identical_algorithm_job(self):
+        source = self.synthetic_reference()
+        output = self.root / 'thread_settings_resume'
+        first = engine.run_alignment([source], source, output, workers=1, compute_threads=1)
+        self.assertTrue(first['passed'])
+        configuration = (output / 'job_config.json').read_bytes()
+        target = output / 'frames' / source.name
+        stamp = target.stat().st_mtime_ns
+        events = []
+        second = engine.run_alignment([source], source, output, workers=1, compute_threads=2,
+                                      progress=events.append, memory_policy='expanded')
+        self.assertTrue(second['passed'])
+        self.assertEqual(second['resumed_frames'], 1)
+        self.assertEqual(second['processed_new'], 0)
+        self.assertEqual(second['memory_policy'], 'expanded')
+        self.assertIsNone(second['throughput_fps'])
+        self.assertEqual(target.stat().st_mtime_ns, stamp)
+        self.assertEqual((output / 'job_config.json').read_bytes(), configuration)
+        runtime = json.loads((output / 'reports' / 'runtime.json').read_text(encoding='utf-8'))
+        self.assertEqual(runtime['memory_policy'], 'expanded')
+        self.assertEqual(runtime['performance_resources']['memory_policy'], 'expanded')
+        audit_events = [event for event in events if event['stage'] == 'audit']
+        self.assertTrue(audit_events)
+        self.assertIsNone(audit_events[-1]['eta_seconds'])
+        self.assertEqual(audit_events[-1]['audit_done'], 1)
+        self.assertEqual(audit_events[-1]['audit_total'], 1)
 
 
 @unittest.skipUnless(os.environ.get('MOONALIGN_TEST_INPUT') and os.environ.get('MOONALIGN_TEST_OUTPUT'),

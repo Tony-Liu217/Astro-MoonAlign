@@ -3,10 +3,13 @@
 **为完整月盘序列做精细旋转与平移配准，再交给 AutoStakkert! 叠加。**  
 **Fine rotation and translation alignment for full-disc lunar sequences, ready for stacking in AutoStakkert!**
 
-[下载 v1.0.0 初版预览 · Windows x64 便携版 / Download preview portable ZIP](https://github.com/Tony-Liu217/Astro-MoonAlign/releases/download/v1.0.0/MoonAlign_Windows_x64_v1.0.0.zip) · [版本与校验文件 / Release files](https://github.com/Tony-Liu217/Astro-MoonAlign/releases/tag/v1.0.0) · [English](#english)
+**最新预览版：v1.1.1，包含性能设置与高级内存选项。**  
+**Latest preview release: v1.1.1, including performance controls and the advanced memory option.**
+
+[下载 v1.1.1 · Windows x64 便携版 / Download v1.1.1 portable ZIP](https://github.com/Tony-Liu217/Astro-MoonAlign/releases/download/v1.1.1/MoonAlign_Windows_x64_v1.1.1.zip) · [版本与校验文件 / Release files](https://github.com/Tony-Liu217/Astro-MoonAlign/releases/tag/v1.1.1) · [English](#english)
 
 解压后运行 `MoonAlign.exe`，无需安装 Python。请保留整个便携文件夹。当前界面为中文。  
-Extract and run `MoonAlign.exe`; Python is not required. Keep the entire portable folder together. **GUI currently in Chinese; English instructions below.** This is the v1.0.0 preview release.
+Extract and run `MoonAlign.exe`; Python is not required. Keep the entire portable folder together. **GUI currently in Chinese; English instructions below.** This is the v1.1.1 preview release.
 
 ## 中文
 
@@ -34,9 +37,17 @@ PIPP、AutoStakkert! 和后期软件需另行准备。MoonAlign 在本机处理�
 
 可以点击取消；程序会让在途图片安全完成后停止。使用**相同的图片选择、参考片和输出目录**重新开始，即可校验检查点并续跑；已经通过且未变化的输出会复用。更换素材、参考片或算法版本时，请使用新输出目录。
 
+### v1.1 性能设置
+
+提供安静、均衡、高性能和自定义四种资源模式，默认均衡。它们调整同时处理的图片数量和 OpenCV 内部线程数，**不降低配准检查标准，也不改变刚性配准模型**。自定义模式适合根据本机 CPU、内存和磁盘调整并发；更多并发会占用更多内存，不一定更快。
+
+资源设置不改变任务的配准配置，可在相同任务中调整并发后续跑。原片只读、RGB16 输出、独立检查和最终完整性审计保持不变。各模式、实测条件与速度/资源取舍见 [性能说明](docs/performance.md)。
+
+v1.1.1 在自定义模式增加默认关闭的“放宽内存限制（高级）”。它减少保留内存预算，允许在资源足够时选择更多并发；每张照片的内存估算、CPU 上限和所有质量检查保持不变，其他模式继续采用保守策略。先在当前作业中安全取消，等待在途照片完成，再用新版、相同输入/参考片/输出目录续跑。电脑空闲并释放内存后，可从 **4 张并发 × 2 计算线程**试起；实际资源上限允许时再考虑 6 × 2。20 逻辑核的预算最多容纳 5 × 4，不能把 6 × 4 当作有效配置。内存高占用时，增加并发可能因换页而更慢，并不保证提速。
+
 ### 输入与适用边界
 
-| 项目 | v1.0.0 要求 |
+| 项目 | 当前输入要求 |
 | --- | --- |
 | 文件 | 同一文件夹内的 `.tif` / `.tiff`，RGB 三通道，每通道 16 位 |
 | 图幅 | 所选图片尺寸一致，每边 800–6000 像素，方向正常 |
@@ -71,14 +82,14 @@ PIPP、AutoStakkert! 和后期软件需另行准备。MoonAlign 在本机处理�
 
 ### 验证状态
 
-这是初版预览（prerelease），验证范围如下：
+以下是 v1.0.0 基础算法与封装的验证范围；v1.1 的性能与回归记录另见 [性能说明](docs/performance.md)。
 
 - 配准算法的命令行前身已完成一组 **4080 张**实拍月面 TIFF 的处理；这不等于用当前 GUI 再次完整跑过 4080 张。
 - GUI 所用引擎对横跨拍摄时段的 **10 张实拍 TIFF** 全部配准通过；该组独立纹理残差中位约 **0.337 像素**，最大剩余旋转约 **0.0119°**。这些数值描述该组测试，不是对任意素材的精度承诺。
 - **19 项不创建窗口的自动检查**通过，覆盖核心处理与界面完成状态逻辑；另验证了部分选择、取消续跑、损坏输出重建、已知变换、无效输入拒绝和原片未变化。
 - Windows x64 便携 EXE 的无窗口自检、运行库导入、RGB16 TIFF 精确写入读回及刚性变换数值检查通过；交付 ZIP 的完整性和源码指纹已核对。
 
-实际 GUI 点击流程、窗口布局、跨电脑兼容性和全新环境构建仍有待更完整的人工验收。建议先用少量自己的素材检查。详细记录见 [验证记录](docs/VALIDATION.md)，操作摘要见 [快速入门](docs/quick-start.zh-CN.txt)。
+v1.1 原生窗口已打开，资源模式控件、内存摘要、速度/ETA 和开始按钮可见，文件夹对话框可正常弹出；完整选图到处理完成的界面流程尚未运行。跨电脑兼容性和全新环境构建仍待验收。建议先用少量自己的素材检查。详细记录见 [验证记录](docs/VALIDATION.md)，操作摘要见 [快速入门](docs/quick-start.zh-CN.txt)。
 
 ### 从源码运行、测试与构建
 
@@ -97,7 +108,7 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-默认执行 10 项核心检查和 9 项界面逻辑检查；真实素材集成测试默认跳过。可按 [`test_engine.py`](test_engine.py) 文件开头的说明设置 `MOONALIGN_TEST_INPUT`、`MOONALIGN_TEST_OUTPUT`，以及可选的 `MOONALIGN_TEST_REFERENCE` 运行集成测试；测试输出必须使用新目录。
+当前默认执行 20 项核心检查和 32 项界面逻辑检查，共 52 项；真实素材集成测试默认跳过。可按 [`test_engine.py`](test_engine.py) 文件开头的说明设置 `MOONALIGN_TEST_INPUT`、`MOONALIGN_TEST_OUTPUT`，以及可选的 `MOONALIGN_TEST_REFERENCE` 运行集成测试；测试输出必须使用新目录。
 
 在 Windows x64 上构建便携版：
 
@@ -107,7 +118,7 @@ py -3.10 -m venv .build-venv
 .\.build-venv\Scripts\python.exe build_portable.py
 ```
 
-构建入口为 [`build_portable.py`](build_portable.py) 和 [`MoonAlign.spec`](MoonAlign.spec)，默认生成 `dist/MoonAlign/` 与 `release/` 中的 ZIP。便携版也支持无窗口运行库自检，在可写目录中执行：
+构建入口为 [`build_portable.py`](build_portable.py) 和 [`MoonAlign.spec`](MoonAlign.spec)，版号来自应用本身。v1.1.1 默认生成 `release/v1.1.1/dist/MoonAlign/`、同目录下的两个 ZIP 及 `SHA256SUMS.txt`，保留旧版存档。构建前会核对已安装依赖与固定版本一致。便携版也支持无窗口运行库自检，在可写目录中执行：
 
 ```powershell
 .\MoonAlign.exe --self-check self-check.json
@@ -145,9 +156,17 @@ PIPP, AutoStakkert! and post-processing tools are separate applications. MoonAli
 
 Cancel stops new work and lets in-flight frames finish safely. Restart with **the same file selection, reference and output folder** to validate checkpoints and resume. Previously passed, unchanged outputs are reused. Use a new output folder when changing the inputs, reference or algorithm version.
 
+### v1.1 performance settings
+
+Quiet, Balanced, Performance and Custom resource modes are available; Balanced is the default. They control the number of images processed simultaneously and OpenCV's internal thread count. **They do not relax registration checks or change the rigid alignment model.** Custom mode lets you tune concurrency to your CPU, memory and storage; more parallel work uses more memory and is not always faster.
+
+Resource settings do not change the registration configuration, so concurrency can be adjusted when resuming the same job. Read-only sources, RGB16 output, independent checks and the final integrity audit remain in place. See [performance notes](docs/performance.md) for modes, test conditions and resource trade-offs.
+
+v1.1.1 adds “放宽内存限制（高级）” (relax memory limits, advanced) in Custom mode, off by default. It reduces reserved headroom so more frames can run when resources permit; per-frame estimates, CPU limits and quality checks remain unchanged. Other modes retain the conservative policy. Safely cancel the current job and wait for in-flight frames to finish, then resume in the new version with the same inputs, reference and output folder. After freeing memory on an otherwise idle computer, start with **4 concurrent images × 2 compute threads**, and consider 6 × 2 only if the actual limit permits it. A 20-logical-CPU budget supports at most 5 × 4, so 6 × 4 is not a valid configuration. With high memory use, extra concurrency can cause paging and run slower; it does not guarantee a speed-up.
+
 ### Supported input and limits
 
-| Item | v1.0.0 requirement |
+| Item | Current input requirement |
 | --- | --- |
 | Files | `.tif` / `.tiff` in one folder; three-channel RGB, 16 bits per channel |
 | Canvas | Identical dimensions, 800–6000 pixels on each side, normal orientation |
@@ -182,14 +201,14 @@ An uncompressed 1800×1800 RGB16 TIFF is about **19.4 MB**; 4080 frames need app
 
 ### Validation status
 
-This is an initial preview (prerelease), with the following validation scope:
+The following describes the v1.0.0 baseline algorithm and packaging validation. See [performance notes](docs/performance.md) for v1.1 performance and regression results.
 
 - The command-line predecessor of the registration algorithm processed a real **4080-frame** lunar TIFF sequence. The full sequence has not been rerun through the current GUI version.
 - The GUI's engine passed **10 real TIFFs** spread across the capture period. This test had a median independent texture residual of approximately **0.337 pixels**, with a maximum remaining rotation of approximately **0.0119°**. These measurements describe that dataset, not a promised accuracy for arbitrary inputs.
 - **19 automated checks without creating a window** passed, covering core processing and GUI completion-state logic. Additional checks covered partial selection, cancellation and resume, rebuilding a damaged output, known transforms, invalid-input rejection and unchanged sources.
 - The Windows x64 portable EXE passed a windowless runtime self-check, dependency imports, an exact RGB16 TIFF write/read round trip and rigid-transform numerical checks. Release ZIP integrity and application source fingerprints were verified.
 
-The actual GUI click-through workflow, window layout, compatibility across different computers and a build in a newly provisioned environment still need broader manual validation. Start with a small selection of your own frames. See the bilingual [validation record](docs/VALIDATION.md) and the [quick-start guide](docs/quick-start.zh-CN.txt), currently in Chinese.
+The native v1.1 window was opened: resource controls, memory summary, speed/ETA and Start were visible, and the folder dialog opened normally. The full GUI workflow from input selection to completed processing has not been run. Cross-computer compatibility and a build in a newly provisioned environment remain to be verified. Start with a small selection of your own frames. See the bilingual [validation record](docs/VALIDATION.md) and the [quick-start guide](docs/quick-start.zh-CN.txt), currently in Chinese.
 
 ### Run, test and build from source
 
@@ -208,7 +227,7 @@ Run the checks that do not create a window:
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-By default these run 10 core checks and 9 GUI logic checks; the real-data integration test is skipped. To enable it, follow the header of [`test_engine.py`](test_engine.py) and set `MOONALIGN_TEST_INPUT`, `MOONALIGN_TEST_OUTPUT`, and optionally `MOONALIGN_TEST_REFERENCE`. The integration output must be a new directory.
+The current defaults run 20 core checks and 32 GUI logic checks, 52 in total; the real-data integration test is skipped. To enable it, follow the header of [`test_engine.py`](test_engine.py) and set `MOONALIGN_TEST_INPUT`, `MOONALIGN_TEST_OUTPUT`, and optionally `MOONALIGN_TEST_REFERENCE`. The integration output must be a new directory.
 
 Build the portable edition on Windows x64:
 
@@ -218,7 +237,7 @@ py -3.10 -m venv .build-venv
 .\.build-venv\Scripts\python.exe build_portable.py
 ```
 
-The build uses [`build_portable.py`](build_portable.py) and [`MoonAlign.spec`](MoonAlign.spec). Defaults produce `dist/MoonAlign/` and ZIP archives under `release/`. The portable EXE also offers a windowless runtime self-check; run it from a writable directory:
+The build uses [`build_portable.py`](build_portable.py) and [`MoonAlign.spec`](MoonAlign.spec), taking the version from the application. For v1.1.1, defaults produce `release/v1.1.1/dist/MoonAlign/`, two ZIP archives and `SHA256SUMS.txt` in `release/v1.1.1/`, leaving previous version archives intact. Installed dependencies are checked against the pinned requirements before building. The portable EXE also offers a windowless runtime self-check; run it from a writable directory:
 
 ```powershell
 .\MoonAlign.exe --self-check self-check.json

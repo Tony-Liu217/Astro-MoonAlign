@@ -17,12 +17,22 @@ def self_check(report_path):
         import tkinter
         from moonalign import __version__
         from moonalign import gui
-        from moonalign.engine import rigid, transform, write_tiff, verify_written
+        from moonalign.engine import rigid, transform, write_tiff, verify_written, get_performance_profile
 
         report['application_version'] = __version__
         report['frozen'] = bool(getattr(sys, 'frozen', False))
         report['versions'] = {'opencv': cv2.__version__, 'numpy': np.__version__,
                               'Pillow': PIL.__version__, 'Tk': tkinter.TkVersion}
+        report['performance_profiles'] = {
+            mode: get_performance_profile((1800, 1800), mode)
+            for mode in ('quiet', 'balanced', 'performance')
+        }
+        report['expanded_memory_profile'] = get_performance_profile(
+            (1800, 1800), 'custom', workers=1, compute_threads=1,
+            memory_policy='expanded')
+        if any(profile['workers'] < 1 or profile['compute_threads'] < 1
+               for profile in report['performance_profiles'].values()):
+            raise RuntimeError('Performance resource detection failed')
         points = np.array([[0., 0.], [17., 2.], [3., 16.], [15., 18.]])
         a = np.deg2rad(3.125)
         expected = np.array([[np.cos(a), -np.sin(a), 2.75],

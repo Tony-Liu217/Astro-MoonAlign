@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .test_tmp/
+.bench/
+.maintenance/
 .venv*/
 .build-venv/
 venv/

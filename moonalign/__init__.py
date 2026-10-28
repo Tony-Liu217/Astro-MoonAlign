@@ -1,6 +1,6 @@
 """MoonAlign: lunar image pre-registration for AutoStakkert."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.1"
 
 
 def startup_failure(details: str) -> int:

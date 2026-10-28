@@ -1,0 +1,55 @@
+{
+  "hardware": "Intel Core i7-12700KF, 12 physical / 20 logical cores, 32 GiB RAM",
+  "sample": "32 frames uniformly sampled across one full-disc 1800x1800 RGB16 TIFF sequence",
+  "environment": "Normal Windows process priority; user MoonAlign was idle; each benchmark runs in a separate process",
+  "includes": "initialization, alignment, original SHA256, atomic RGB16 TIFF write/readback, final full audit",
+  "paired_runs": [
+    {
+      "name": "normal_pair_old_w3_t1",
+      "workers": 3,
+      "opencv_threads": 1,
+      "wall_seconds": 15.93737190000138,
+      "frames_per_second": 2.00785927571893,
+      "peak_private_bytes": 3170701312,
+      "priority_class": 32
+    },
+    {
+      "name": "normal_pair_new_w3_t2",
+      "workers": 3,
+      "opencv_threads": 2,
+      "wall_seconds": 13.581407600000603,
+      "frames_per_second": 2.3561622581740775,
+      "peak_private_bytes": 3132014592,
+      "priority_class": 32
+    },
+    {
+      "name": "normal_pair_new_w3_t4",
+      "workers": 3,
+      "opencv_threads": 4,
+      "wall_seconds": 12.24597939999876,
+      "frames_per_second": 2.6131025502136023,
+      "peak_private_bytes": 3125145600,
+      "priority_class": 32
+    }
+  ],
+  "quality_hash_comparison": [
+    {
+      "name": "normal_pair_new_w3_t2",
+      "exact_matching_output_sha256": 32,
+      "total": 32
+    },
+    {
+      "name": "normal_pair_new_w3_t4",
+      "exact_matching_output_sha256": 32,
+      "total": 32
+    }
+  ],
+  "quality": {
+    "success": 32,
+    "failed": 0,
+    "median_independent_error_px": 0.3277490735054016,
+    "worst_remaining_angle_deg": 0.019397237794740257,
+    "refined_frames": 13,
+    "same_all_runs": true
+  }
+}
