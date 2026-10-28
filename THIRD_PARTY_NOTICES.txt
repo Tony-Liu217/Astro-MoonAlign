@@ -1,0 +1,19 @@
+MoonAlign 1.0.0 — third-party components
+
+The portable Windows application includes these components:
+Python 3.10.11 and its standard library (including tkinter)
+Tcl/Tk 8.6 (the graphical interface runtime)
+NumPy 2.2.6 (including its wheel's bundled numerical libraries)
+OpenCV / opencv-python 4.13.0.92 (including its wheel's bundled libraries)
+Pillow 12.1.1 (including its wheel's bundled image libraries)
+PyInstaller 6.22.3 bootloader
+typing_extensions 4.15.0 (included for NumPy's compatibility imports)
+
+Full license texts and bundled third-party notices copied from the installed
+distributions are included under licenses/. Those texts, including notices
+for bundled numerical and image-codec libraries, govern their components.
+PyInstaller's license includes the bootloader exception; see its COPYING.txt.
+The application source is licensed separately in LICENSE.
+
+No photographic source images are included in this distribution.
+MoonAlign processes local files and does not upload images.

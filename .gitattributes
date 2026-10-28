@@ -1,0 +1,11 @@
+* text=auto
+# Preserve the validated Python source bytes recorded in the portable build.
+*.py -text whitespace=cr-at-eol,-blank-at-eof
+*.spec -text whitespace=cr-at-eol,-blank-at-eof
+*.md text eol=lf whitespace=-blank-at-eol
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+licenses/** -whitespace

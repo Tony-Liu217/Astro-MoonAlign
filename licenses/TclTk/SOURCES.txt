@@ -1,0 +1,11 @@
+Tcl/Tk version: 8.6.12 (Python 3.10.11 Windows distribution)
+
+tk8.6/license.terms and tk8.6/demos/license.terms were copied from the
+installed Python distribution's tcl/tk8.6 directory.
+
+The Tcl license was absent from that installed runtime's tcl8.6 directory;
+tcl8.6/license.terms was obtained unchanged from the corresponding official
+source version:
+https://raw.githubusercontent.com/tcltk/tcl/core-8-6-12/license.terms
+
+All license files are retained verbatim.
